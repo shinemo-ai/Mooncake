@@ -20,6 +20,8 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include "common/net_utils.h"
+
 namespace mooncake {
 void loadGlobalConfig(GlobalConfig& config) {
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
@@ -82,6 +84,31 @@ void loadGlobalConfig(GlobalConfig& config) {
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
                          << pkey_index_env << ". Error: " << e.what();
+        }
+    }
+
+    const char* gid_addr_family_env = std::getenv("MC_GID_ADDR_FAMILY");
+    if (gid_addr_family_env) {
+        if (strcmp(gid_addr_family_env, "AF_INET") == 0)
+            config.gid_addr_family = AF_INET;
+        else if (strcmp(gid_addr_family_env, "AF_INET6") == 0)
+            config.gid_addr_family = AF_INET6;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_GID_ADDR_FAMILY, expect AF_INET or AF_INET6";
+    }
+
+    const char* gid_prefer_subnet_env = std::getenv("MC_GID_PREFER_SUBNET");
+    if (gid_prefer_subnet_env && *gid_prefer_subnet_env) {
+        uint32_t net = 0, mask = 0;
+        if (parseIpv4CidrConfig(gid_prefer_subnet_env, &net, &mask)) {
+            config.gid_prefer_subnet_net = net;
+            config.gid_prefer_subnet_mask = mask;
+            config.gid_prefer_subnet_set = true;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_GID_PREFER_SUBNET, malformed CIDR: "
+                         << gid_prefer_subnet_env;
         }
     }
 
@@ -421,6 +448,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    LOG(INFO) << "gid_addr_family = "
+              << (config.gid_addr_family == AF_INET6 ? "AF_INET6" : "AF_INET");
+    LOG(INFO) << "gid_prefer_subnet_set = " << config.gid_prefer_subnet_set;
 }
 
 GlobalConfig& globalConfig() {

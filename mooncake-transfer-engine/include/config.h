@@ -74,6 +74,17 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+
+    // ---- GID selection (aligned with NCCL's IB connect logic) ----
+
+    // Preferred address family: AF_INET or AF_INET6. MC_GID_ADDR_FAMILY.
+    int gid_addr_family = AF_INET;
+
+    // Optional IPv4 subnet preference, single CIDR in network byte order.
+    // MC_GID_PREFER_SUBNET=10.0.0.0/16
+    bool gid_prefer_subnet_set = false;
+    uint32_t gid_prefer_subnet_net = 0;
+    uint32_t gid_prefer_subnet_mask = 0;
 };
 
 struct RpcCommunicatorConfig {

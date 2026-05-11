@@ -20,11 +20,13 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <memory>
 #include <thread>
 
+#include "common/net_utils.h"
 #include "config.h"
 #include "cuda_alike.h"
 #include "transport/rdma_transport/endpoint_store.h"
@@ -489,10 +491,35 @@ static const char *GidNetworkStateToString(GidNetworkState state) {
                : "without network device";
 }
 
+// Dispatch between two implementations via MC_GID_SELECTOR=legacy|v2.
+// Default is v2 (best-fit). The env is read once per process.
 GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
                                               struct ibv_context *context,
                                               ibv_port_attr &port_attr,
                                               uint8_t port, int &gid_index) {
+    static const bool use_legacy = []() {
+        const char *env = std::getenv("MC_GID_SELECTOR");
+        if (env && strcmp(env, "legacy") == 0) return true;
+        if (env && strcmp(env, "v2") != 0) {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_GID_SELECTOR='"
+                         << env << "', defaulting to v2";
+        }
+        return false;
+    }();
+    return use_legacy
+        ? findBestGidIndex_legacy(device_name, context, port_attr, port,
+                                  gid_index)
+        : findBestGidIndex_v2(device_name, context, port_attr, port,
+                              gid_index);
+}
+
+// Legacy first-fit selection. Identical to the upstream version, except
+// the failure path of ibv_query_gid_ex uses 'continue' so holes in the
+// GID table do not cut off later valid entries.
+GidNetworkState RdmaContext::findBestGidIndex_legacy(
+    const std::string &device_name, struct ibv_context *context,
+    ibv_port_attr &port_attr, uint8_t port, int &gid_index) {
     gid_index = -1;
     int i;
     struct ibv_gid_entry gid_entry;
@@ -503,8 +530,8 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
-            // Reached end of valid GID indices
-            break;
+            // Skip holes in the GID table
+            continue;
         }
 
         if (gid_entry.gid_type != IBV_GID_TYPE_ROCE_V2 &&
@@ -555,6 +582,72 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
     }
 
     return state;
+}
+
+// Best-fit selection modeled after NCCL's ncclUpdateGidIndex. Each candidate
+// scores a tuple (valid, fam_match, has_ndev, subnet_ok); the highest tuple
+// wins. NULL and link-local GIDs score valid=0 and are eliminated.
+GidNetworkState RdmaContext::findBestGidIndex_v2(
+    const std::string &device_name, struct ibv_context *context,
+    ibv_port_attr &port_attr, uint8_t port, int &gid_index) {
+    gid_index = -1;
+
+    auto &cfg = globalConfig();
+    const int pref_family = cfg.gid_addr_family;
+
+    struct Score {
+        int valid;
+        int fam_match;
+        int has_ndev;
+        int subnet_ok;
+        bool operator<(const Score &o) const {
+            if (valid != o.valid) return valid < o.valid;
+            if (fam_match != o.fam_match) return fam_match < o.fam_match;
+            if (has_ndev != o.has_ndev) return has_ndev < o.has_ndev;
+            return subnet_ok < o.subnet_ok;
+        }
+    };
+
+    int best_idx = -1;
+    Score best{0, 0, 0, 0};
+
+    for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+        struct ibv_gid_entry gid_entry;
+        if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
+            // Skip holes in the GID table
+            continue;
+        }
+
+        if (isNullGid(reinterpret_cast<ibv_gid *>(&gid_entry.gid))) continue;
+        if (isLinkLocalGid(gid_entry.gid.raw)) continue;
+        if (gid_entry.gid_type != IBV_GID_TYPE_ROCE_V2 &&
+            gid_entry.gid_type != IBV_GID_TYPE_IB) {
+            continue;
+        }
+
+        const bool is_v4 =
+            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2 &&
+            ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
+        const bool fam_match = (pref_family == AF_INET) ? is_v4 : !is_v4;
+        const bool has_ndev = hasNetworkDevice(device_name, port, i);
+        const bool subnet_ok =
+            is_v4 ? gidMatchesSubnetPref(gid_entry.gid.raw,
+                                         cfg.gid_prefer_subnet_net,
+                                         cfg.gid_prefer_subnet_mask,
+                                         cfg.gid_prefer_subnet_set)
+                  : true;
+
+        Score s{1, fam_match ? 1 : 0, has_ndev ? 1 : 0, subnet_ok ? 1 : 0};
+        if (best_idx < 0 || best < s) {
+            best = s;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx < 0) return GidNetworkState::GID_NOT_FOUND;
+    gid_index = best_idx;
+    return best.has_ndev ? GidNetworkState::GID_WITH_NETWORK
+                         : GidNetworkState::GID_WITHOUT_NETWORK;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
