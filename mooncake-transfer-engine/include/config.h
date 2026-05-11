@@ -17,6 +17,7 @@
 
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
+#include <sys/socket.h>
 
 #include <cstddef>
 #include <cstdint>
