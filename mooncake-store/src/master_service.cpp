@@ -4855,17 +4855,21 @@ bool MasterService::TryRestoreStateFromSnapshot(
             const bool skip_cleanup = std::getenv(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
-                auto cleanup_now = now;
                 for (auto& shard : metadata_shards_) {
                     for (auto tenant_it = shard.tenants.begin();
                          tenant_it != shard.tenants.end();) {
                         auto& tenant_state = tenant_it->second;
                         for (auto it = tenant_state.metadata.begin();
                              it != tenant_state.metadata.end();) {
+                            // Only clear entries with incomplete replicas.
+                            // Do NOT clear entries whose leases have expired
+                            // due to master downtime — that data is still
+                            // valid on the store side and clients may still
+                            // need it after reconnection. Expired entries
+                            // will be naturally reclaimed by the normal
+                            // eviction/reaper cycles after restore.
                             if (it->second.HasDiffRepStatus(
-                                    ReplicaStatus::COMPLETE) ||
-                                (it->second.IsLeaseExpired(cleanup_now) &&
-                                 !it->second.IsSoftPinned(cleanup_now))) {
+                                    ReplicaStatus::COMPLETE)) {
                                 VLOG(1) << "clear metadata key=" << it->first;
                                 it = EraseMetadata(tenant_state, it,
                                                    tenant_it->first);
