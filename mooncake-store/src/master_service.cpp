@@ -135,6 +135,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      restore_grace_period_sec_([]() -> int64_t {
+          const char* env = std::getenv("MC_RESTORE_GRACE_PERIOD_SEC");
+          if (env) {
+              try {
+                  int64_t val = std::stoll(env);
+                  if (val > 0) return val;
+              } catch (...) {}
+          }
+          return 60;
+      }()),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -4964,6 +4974,21 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
         }
 
+        // Set restore grace period to allow clients time to remount
+        {
+            auto grace_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(restore_grace_period_sec_);
+            auto deadline_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    grace_deadline.time_since_epoch())
+                    .count();
+            restore_grace_deadline_epoch_ms_.store(deadline_ms,
+                                                  std::memory_order_relaxed);
+            LOG(INFO) << "[Restore] Client expire grace period set to "
+                      << restore_grace_period_sec_ << "s";
+        }
+
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
         return true;
@@ -5557,16 +5582,31 @@ void MasterService::ClientMonitorFunc() {
                 now + std::chrono::seconds(client_live_ttl_sec_);
         }
 
-        // Find out expired clients
+        // Find out expired clients (skip during restore grace period)
         std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        int64_t grace_deadline_ms =
+            restore_grace_deadline_epoch_ms_.load(std::memory_order_relaxed);
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+        bool in_grace_period = (grace_deadline_ms > 0 && now_ms < grace_deadline_ms);
+        if (in_grace_period) {
+            // During restore grace period, do not expire any clients
+        } else {
+            if (grace_deadline_ms > 0) {
+                // Grace period just ended, clear the deadline
+                restore_grace_deadline_epoch_ms_.store(0,
+                                                      std::memory_order_relaxed);
+            }
+            for (auto it = client_ttl.begin(); it != client_ttl.end();) {
+                if (it->second < now) {
+                    LOG(INFO) << "client_id=" << it->first
+                              << ", action=client_expired";
+                    expired_clients.push_back(it->first);
+                    it = client_ttl.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
