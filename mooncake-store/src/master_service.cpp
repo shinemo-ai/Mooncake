@@ -1769,7 +1769,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id, Replica& replica)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, MakeObjectIdentity(key, tenant_id));
+    const auto object_id = MakeObjectIdentity(key, tenant_id);
+    MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         accessor.Create(
             client_id,
@@ -1790,23 +1791,21 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return {};
     }
 
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
+    auto* local_disk_replica =
+        metadata.GetFirstReplica(&Replica::fn_is_local_disk_replica);
+    if (local_disk_replica == nullptr) {
+        return {};
+    }
+
+    const auto incoming = replica.get_descriptor().get_local_disk_descriptor();
+    const auto previous_owner = local_disk_replica->get_local_disk_client_id();
+    local_disk_replica->update_local_disk_replica(
+        client_id, incoming.object_size, incoming.transport_endpoint);
+
+    auto& tenant_state = accessor.GetTenantState();
+    if (!previous_owner.has_value() || previous_owner.value() != client_id) {
+        ErasePromotionTaskIfPresent(tenant_state, object_id.user_key);
+    }
     return {};
 }
 

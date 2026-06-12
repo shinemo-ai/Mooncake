@@ -205,6 +205,48 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
+// Re-registering a LOCAL_DISK key from a restarted store should transfer
+// ownership to the new client and drop any stale promotion task pinned to the
+// old holder.
+TEST_F(PromotionOnHitTest, NotifyOffloadSuccessRebindsLocalDiskOwner) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    UUID old_client = PrepareLocalDiskOnlyClient(*service);
+    UUID new_client = PrepareLocalDiskOnlyClient(*service);
+
+    const std::string key = "k_rebind";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, old_client, key, 1024,
+                                       "old-holder"));
+
+    auto first_get = service->GetReplicaList(key);
+    ASSERT_TRUE(first_get.has_value());
+
+    auto pending_old_before = service->PromotionObjectHeartbeat(old_client);
+    ASSERT_TRUE(pending_old_before.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_old_before, key), 1u);
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, new_client, key, 1024,
+                                       "new-holder"));
+
+    auto pending_old_after = service->PromotionObjectHeartbeat(old_client);
+    ASSERT_TRUE(pending_old_after.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_old_after, key), 0u);
+
+    auto second_get = service->GetReplicaList(key);
+    ASSERT_TRUE(second_get.has_value());
+
+    auto pending_new_after = service->PromotionObjectHeartbeat(new_client);
+    ASSERT_TRUE(pending_new_after.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_new_after, key), 1u);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty task list when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
