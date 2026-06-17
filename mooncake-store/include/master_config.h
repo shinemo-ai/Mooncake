@@ -109,11 +109,9 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    // Max promotion tasks PromotionObjectHeartbeat returns to a single
-    // client per call. Each task is a synchronous SSD-read + RDMA-write
-    // on the client; serializing them avoids blocking past the client-
-    // liveness window. Default 1 is conservative; small-object or RDMA-
-    // rich clusters may safely raise it.
+    // Max promotion tasks per PromotionObjectHeartbeat call (batch size).
+    // Default 1 is conservative; raise when object sizes and staging
+    // buffer capacity permit more parallelism per cycle.
     uint32_t promotion_max_per_heartbeat = 1;
 };
 

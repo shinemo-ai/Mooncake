@@ -621,8 +621,7 @@ class MasterService {
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
-     * refcnt; erase per-shard and per-client task entries. Mirror of
-     * NotifyOffloadSuccess.
+     * refcnt; erase per-shard and per-client task entries.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
                                 const std::string& tenant_id)
@@ -649,6 +648,36 @@ class MasterService {
     auto NotifyPromotionFailure(const UUID& client_id, const std::string& key,
                                 const std::string& tenant_id)
         -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Batch allocate MEMORY replicas for multiple promotion keys.
+     * Follows BatchPutStart's pattern: loops per-key inside one RPC call.
+     */
+    auto BatchPromotionAllocStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+        const std::vector<std::string>& preferred_segments)
+        -> std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>;
+
+    /**
+     * @brief Batch commit staged MEMORY replicas for multiple keys.
+     * Mirrors NotifyOffloadSuccess: the client processes a batch of
+     * promotion tasks and reports all results in a single RPC.
+     * Returns per-key results.
+     */
+    auto BatchNotifyPromotionSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
+    /**
+     * @brief Batch release promotion task state for multiple keys that
+     * failed between PromotionAllocStart and transfer completion.
+     */
+    auto BatchNotifyPromotionFailure(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id)
+        -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -1746,6 +1775,10 @@ class MasterService {
     bool promotion_on_hit_{false};
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
+    // Max promotion tasks returned per PromotionObjectHeartbeat call.
+    // Tunes the batch size the client processes in one cycle, indirectly
+    // capping staging-buffer pressure. Default 1 is conservative; raise
+    // when SSD read throughput and staging buffer capacity allow.
     uint32_t promotion_max_per_heartbeat_{1};
     // Global in-flight task counter, checked against promotion_queue_limit_
     // as the gate cap. Promotion specifically targets skewed

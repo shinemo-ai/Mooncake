@@ -3481,15 +3481,17 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    // Return at most promotion_max_per_heartbeat_ tasks. Each task does
-    // a synchronous SSD read + RDMA write on the client side; allowing
-    // more than one per heartbeat risks blocking past the client-
-    // liveness window and the master marking the client dead. The rest
-    // stay queued in promotion_objects for subsequent heartbeats. The
-    // cap must live here (server side) rather than on the client so
-    // leftover work isn't silently dropped.
+    // Drain up to promotion_max_per_heartbeat_ tasks per heartbeat.
+    // This controls the batch size the client processes in one cycle,
+    // indirectly capping staging-buffer pressure from the subsequent
+    // batched SSD reads. Remaining tasks stay queued for the next
+    // heartbeat. Set higher when object sizes are small and staging
+    // buffer capacity allows; lower when objects are large or the
+    // staging buffer is shared with normal read traffic.
     auto& src = local_disk_segment_it->second->promotion_objects;
     std::vector<PromotionTaskItem> result;
+    result.reserve(std::min(src.size(),
+                            static_cast<size_t>(promotion_max_per_heartbeat_)));
     while (result.size() < promotion_max_per_heartbeat_ && !src.empty()) {
         auto node = src.extract(src.begin());
         result.push_back(std::move(node.mapped()));
@@ -3724,6 +3726,48 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     }
 
     return {};
+}
+
+auto MasterService::BatchPromotionAllocStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+    const std::vector<std::string>& preferred_segments)
+    -> std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>> {
+    if (keys.size() != sizes.size()) {
+        return std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.push_back(PromotionAllocStart(client_id, keys[i], tenant_id,
+                                              sizes[i], preferred_segments));
+    }
+    return results;
+}
+
+auto MasterService::BatchNotifyPromotionSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(NotifyPromotionSuccess(client_id, key, tenant_id));
+    }
+    return results;
+}
+
+auto MasterService::BatchNotifyPromotionFailure(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(NotifyPromotionFailure(client_id, key, tenant_id));
+    }
+    return results;
 }
 
 void MasterService::EvictionThreadFunc() {

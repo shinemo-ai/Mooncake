@@ -1953,6 +1953,17 @@ WrappedMasterService::PromotionAllocStart(
     return result;
 }
 
+std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+WrappedMasterService::BatchPromotionAllocStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "BatchPromotionAllocStart");
+    timer.LogRequest("action=batch_promotion_alloc_start");
+    return master_service_.BatchPromotionAllocStart(
+        client_id, keys, tenant_id, sizes, preferred_segments);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
@@ -1973,6 +1984,26 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
         master_service_.NotifyPromotionFailure(client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchNotifyPromotionSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchNotifyPromotionSuccess");
+    timer.LogRequest("action=batch_notify_promotion_success");
+    return master_service_.BatchNotifyPromotionSuccess(client_id, keys,
+                                                       tenant_id);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchNotifyPromotionFailure(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchNotifyPromotionFailure");
+    timer.LogRequest("action=batch_notify_promotion_failure");
+    return master_service_.BatchNotifyPromotionFailure(client_id, keys,
+                                                       tenant_id);
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
@@ -2103,10 +2134,19 @@ void RegisterRpcService(
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
             &wrapped_master_service);
     server.register_handler<
+        &mooncake::WrappedMasterService::BatchPromotionAllocStart>(
+        &wrapped_master_service);
+    server.register_handler<
         &mooncake::WrappedMasterService::NotifyPromotionSuccess>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyPromotionFailure>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchNotifyPromotionSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchNotifyPromotionFailure>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);

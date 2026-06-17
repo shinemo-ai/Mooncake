@@ -452,6 +452,15 @@ class Client {
                         const std::vector<std::string>& preferred_segments);
 
     /**
+     * @brief Batch allocate MEMORY replicas for multiple promotion keys.
+     */
+    virtual std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+    BatchPromotionAllocStart(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        const std::vector<uint64_t>& sizes,
+        const std::vector<std::string>& preferred_segments);
+
+    /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
      * client has written the bytes via Transfer Engine.
      */
@@ -468,6 +477,20 @@ class Client {
         const std::string& key);
     virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Batch commit staged MEMORY replicas for multiple keys.
+     */
+    virtual std::vector<tl::expected<void, ErrorCode>>
+    BatchNotifyPromotionSuccess(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
+
+    /**
+     * @brief Batch release promotion task state for multiple keys.
+     */
+    virtual std::vector<tl::expected<void, ErrorCode>>
+    BatchNotifyPromotionFailure(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Write `slices` into the memory replica described by

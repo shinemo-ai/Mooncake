@@ -2977,6 +2977,15 @@ Client::PromotionAllocStart(
                                               preferred_segments);
 }
 
+std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+Client::BatchPromotionAllocStart(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    const std::vector<uint64_t>& sizes,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.BatchPromotionAllocStart(
+        client_id_, keys, tenant_id, sizes, preferred_segments);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     const std::string& key) {
     return master_client_.NotifyPromotionSuccess(client_id_, key);
@@ -2995,6 +3004,20 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key, const std::string& tenant_id) {
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+Client::BatchNotifyPromotionSuccess(const std::vector<std::string>& keys,
+                                    const std::string& tenant_id) {
+    return master_client_.BatchNotifyPromotionSuccess(client_id_, keys,
+                                                      tenant_id);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+Client::BatchNotifyPromotionFailure(const std::vector<std::string>& keys,
+                                    const std::string& tenant_id) {
+    return master_client_.BatchNotifyPromotionFailure(client_id_, keys,
+                                                      tenant_id);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
