@@ -21,7 +21,15 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
     BUILD_WITH_EP=1 \
     EP_TORCH_VERSIONS=${EP_TORCH_VERSIONS} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-    PATH="/usr/local/go/bin:${PATH}"
+    PATH="/usr/local/go/bin:${PATH}" \
+    GOTOOLCHAIN=local \
+    GOPROXY=https://goproxy.cn,direct \
+    PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Use Chinese mirrors for apt
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://ports.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
 
 # Install base build utilities and the requested Python version via deadsnakes PPA
 RUN apt-get update && \
@@ -29,6 +37,7 @@ RUN apt-get update && \
         ca-certificates \
         curl \
         git \
+        lld \
         ninja-build \
         software-properties-common \
         pkg-config && \
@@ -44,6 +53,11 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
+# Configure pip to use mirror
+RUN mkdir -p /root/.config/pip && \
+    echo '[global]' > /root/.config/pip/pip.conf && \
+    echo 'index-url = https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple' >> /root/.config/pip/pip.conf
+
 WORKDIR /workspace
 COPY . /workspace
 
@@ -58,12 +72,16 @@ RUN mkdir -p build && \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
         -DUSE_CUDA=ON \
-        -DWITH_EP=ON \
+        -DWITH_EP=OFF \
         -DSTORE_USE_ETCD=ON \
+        -DUSE_REDIS=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
-        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build .
+    cmake --build . -j$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
 
 # Build nvlink allocator to make wheel self-contained for CUDA paths
 RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
@@ -88,7 +106,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Inherit build-args so the runtime stage installs the matching interpreter
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
-ENV PYTHON_VERSION=${PYTHON_VERSION}
+ENV PYTHON_VERSION=${PYTHON_VERSION} \
+    PIP_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Use Chinese mirrors for apt and pip
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    sed -i 's|http://ports.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list && \
+    mkdir -p /root/.config/pip && \
+    echo '[global]' > /root/.config/pip/pip.conf && \
+    echo 'index-url = https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple' >> /root/.config/pip/pip.conf
 
 # Install runtime dependencies and the requested Python version
 RUN apt-get update && \
@@ -116,7 +143,8 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
+COPY scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
+RUN chmod 755 /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
