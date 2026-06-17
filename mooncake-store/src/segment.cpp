@@ -993,6 +993,13 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         }
     }
 
+    // After recovery, clear client_local_disk_segment_ so that reconnecting
+    // stores receive SEGMENT_NOT_FOUND and trigger a full ScanMeta resync.
+    // Object metadata (LOCAL_DISK replicas) is preserved and remains readable;
+    // only the offloading/promotion task queues are lost and will be
+    // rescheduled.
+    segment_manager_->client_local_disk_segment_.clear();
+
     return {};
 }
 

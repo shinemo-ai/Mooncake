@@ -7,12 +7,12 @@
 //   3. Asserts CaptureServiceState() matches before vs. after.
 //
 // LOCAL_DISK replica content is captured via CaptureServiceState's
-// CompareReplicaDescriptor (which compares LocalDiskDescriptor fields), and
-// LocalDiskSegmentState (offloading_objects map) is also captured. Anything
-// these tests put into those fields will round-trip; anything not captured
-// (e.g., per-shard PromotionTask map, per-segment promotion_objects map)
-// is, by design, transient — the master is allowed to drop it on restart
-// and let clients re-trigger via heartbeat.
+// CompareReplicaDescriptor (which compares LocalDiskDescriptor fields).
+// Since restore now intentionally clears client_local_disk_segment_ to force
+// store-side remount and ScanMeta resync, these tests only require the
+// visible replica metadata to survive restart. The per-client LOCAL_DISK
+// segment state and snapshot "segments" file no longer round-trip byte-for-
+// byte once restore enters resync mode.
 
 #include "master_service_test_for_snapshot_base.h"
 
@@ -127,10 +127,11 @@ TEST_F(MasterServicePromotionSnapshotTest, MixedMemoryAndLocalDiskRoundTrip) {
     EXPECT_EQ(descs->replicas.size(), 2u);
 }
 
-// LocalDiskSegment.enable_offloading flag is preserved across snapshot.
-// (CaptureServiceState compares this explicitly.)
+// Restore intentionally clears client_local_disk_segment_ so stores remount
+// and re-report LOCAL_DISK objects. The user-visible replica metadata still
+// survives snapshot+restore.
 TEST_F(MasterServicePromotionSnapshotTest,
-       LocalDiskSegmentEnableOffloadingPreserved) {
+       LocalDiskSegmentRestoreTriggersResync) {
     CreateMasterServiceWithPromotion();
     UUID client_id = MountMemAndDisk("seg_a", kDefaultSegmentBase);
     (void)client_id;

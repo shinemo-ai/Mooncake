@@ -626,6 +626,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Re-report SSD capacity after remount so master
+                    // can restore file_total_capacity_.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity after remount failed: "
+                                << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
@@ -660,6 +671,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 LOG(ERROR) << "Failed to send heartbeat with error: " << err;
                 return heartbeat_result;
             }
+        }
+    }
+
+    // Refresh SSD capacity on every heartbeat so a restarted master can
+    // recover file_total_capacity_ without requiring store restart.
+    if (config_.total_size_limit > 0) {
+        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+        if (!cap_result) {
+            LOG(WARNING) << "Periodic ReportSsdCapacity failed: "
+                         << cap_result.error();
         }
     }
 

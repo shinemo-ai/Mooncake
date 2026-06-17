@@ -1213,7 +1213,8 @@ auto MasterService::BatchReplicaClear(
                 &Replica::fn_is_completed, [](Replica& replica) {
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
+                    } else if (replica.is_disk_replica() ||
+                               replica.is_local_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
                 });
@@ -1247,7 +1248,8 @@ auto MasterService::BatchReplicaClear(
                     has_replica_on_segment = true;
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
+                    } else if (replica.is_disk_replica() ||
+                               replica.is_local_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
                 });
@@ -1360,7 +1362,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         // TODO: NoF SSD support (ranhaojia)
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
-        } else if (replica_list[0].is_disk_replica()) {
+        } else if (replica_list[0].is_disk_replica() ||
+                   replica_list[0].is_local_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
         }
         MasterMetricManager::instance().inc_valid_get_nums();
@@ -1751,7 +1754,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     if (replica_type == ReplicaType::MEMORY ||
         (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().inc_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
+    } else if (replica_type == ReplicaType::DISK ||
+               replica_type == ReplicaType::LOCAL_DISK) {
         MasterMetricManager::instance().inc_file_cache_nums();
     }  // TODO: add inc_nof_cache_nums() (ranhaojia)
     // 1. Set lease timeout to now, indicating that the object has no lease
@@ -1841,7 +1845,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     if (replica_type == ReplicaType::MEMORY ||
         (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
+    } else if (replica_type == ReplicaType::DISK ||
+               replica_type == ReplicaType::LOCAL_DISK) {
         MasterMetricManager::instance().dec_file_cache_nums();
     }
 
@@ -2241,6 +2246,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                            .get_local_disk_descriptor()
                            .client_id == client_id;
         });
+        MasterMetricManager::instance().dec_file_cache_nums();
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
