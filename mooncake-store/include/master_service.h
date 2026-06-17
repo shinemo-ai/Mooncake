@@ -1616,10 +1616,17 @@ class MasterService {
         tl::expected<void, SerializationError> Deserialize(
             const std::vector<uint8_t>& data);
 
+        const std::unordered_map<std::string, int64_t>&
+        restored_allocated_mem_by_segment() const {
+            return restored_allocated_mem_by_segment_;
+        }
+
         void Reset();
 
        private:
         MasterService* service_;
+        std::unordered_map<std::string, int64_t>
+            restored_allocated_mem_by_segment_;
 
         // Serialize a single ObjectMetadata
         tl::expected<void, SerializationError> SerializeMetadata(
@@ -1636,7 +1643,10 @@ class MasterService {
 
         // Deserialize a single MetadataShard
         tl::expected<void, SerializationError> DeserializeShard(
-            const msgpack::object& obj, MetadataShard& shard);
+            const msgpack::object& obj, MetadataShard& shard,
+            bool keep_incomplete_metadata,
+            std::unordered_map<std::string, std::string>& rebuilt_group_ids,
+            std::unordered_set<std::string>& groups_needing_refresh);
 
         // Serialize discarded replicas
         tl::expected<void, SerializationError> SerializeDiscardedReplicas(

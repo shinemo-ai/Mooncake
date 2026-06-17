@@ -4911,75 +4911,16 @@ bool MasterService::TryRestoreStateFromSnapshot(
         }
 
         {
-            const bool skip_cleanup = std::getenv(
-                "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
-            if (!skip_cleanup) {
-                for (auto& shard : metadata_shards_) {
-                    for (auto tenant_it = shard.tenants.begin();
-                         tenant_it != shard.tenants.end();) {
-                        auto& tenant_state = tenant_it->second;
-                        for (auto it = tenant_state.metadata.begin();
-                             it != tenant_state.metadata.end();) {
-                            // Only clear entries with incomplete replicas.
-                            // Do NOT clear entries whose leases have expired
-                            // due to master downtime — that data is still
-                            // valid on the store side and clients may still
-                            // need it after reconnection. Expired entries
-                            // will be naturally reclaimed by the normal
-                            // eviction/reaper cycles after restore.
-                            if (it->second.HasDiffRepStatus(
-                                    ReplicaStatus::COMPLETE)) {
-                                VLOG(1) << "clear metadata key=" << it->first;
-                                it = EraseMetadata(tenant_state, it,
-                                                   tenant_it->first);
-                            } else {
-                                ++it;
-                            }
-                        }
-                        if (tenant_state.Empty()) {
-                            tenant_it = shard.tenants.erase(tenant_it);
-                        } else {
-                            ++tenant_it;
-                        }
-                    }
-                }
-            }
-
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
             }
 
-            for (auto& shard : metadata_shards_) {
-                for (auto& [tenant_id, tenant_state] : shard.tenants) {
-                    for (auto it = tenant_state.metadata.begin();
-                         it != tenant_state.metadata.end();) {
-                        for (auto& replica : it->second.GetAllReplicas()) {
-                            if (!replica.get_descriptor().is_memory_replica()) {
-                                continue;
-                            }
-                            auto temp_segment_names =
-                                replica.get_segment_names();
-                            if (temp_segment_names.empty()) {
-                                continue;
-                            }
-                            if (!temp_segment_names[0].has_value()) {
-                                continue;
-                            }
-                            auto buffer_descriptor =
-                                replica.get_descriptor()
-                                    .get_memory_descriptor()
-                                    .buffer_descriptor;
-                            MasterMetricManager::instance()
-                                .inc_allocated_mem_size(
-                                    temp_segment_names[0].value(),
-                                    static_cast<int64_t>(
-                                        buffer_descriptor.size_));
-                        }
-                        ++it;
-                    }
-                }
+            for (const auto& [segment_name, allocated_bytes] :
+                 metadata_serializer.restored_allocated_mem_by_segment()) {
+                MasterMetricManager::instance().inc_allocated_mem_size(
+                    segment_name, allocated_bytes);
             }
 
             LOG(INFO)
@@ -6058,6 +5999,8 @@ MasterService::MetadataSerializer::Serialize() {
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::Deserialize(
     const std::vector<uint8_t>& data) {
+    restored_allocated_mem_by_segment_.clear();
+
     // Parse MessagePack data directly
     msgpack::object_handle oh;
     try {
@@ -6105,6 +6048,13 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
     }
 
+    std::unordered_map<std::string, std::string> rebuilt_group_ids;
+    std::unordered_set<std::string> groups_needing_refresh;
+    const bool keep_incomplete_metadata = std::getenv(
+        "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    // Rebuild group routing and surviving-memory metrics while deserializing
+    // to avoid additional full-key passes after restore.
     // Iterate and deserialize each shard
     for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
         // Get shard index
@@ -6144,7 +6094,10 @@ MasterService::MetadataSerializer::Deserialize(
 
         // Get shard reference and deserialize
         auto& shard = service_->metadata_shards_[shard_idx];
-        auto result = DeserializeShard(shard_obj, shard);
+        auto result = DeserializeShard(shard_obj, shard,
+                                       keep_incomplete_metadata,
+                                       rebuilt_group_ids,
+                                       groups_needing_refresh);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -6176,11 +6129,18 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
-    service_->RebuildGroupRoutingIndex();
+    {
+        std::unique_lock<std::shared_mutex> lock(
+            service_->group_routing_mutex_);
+        service_->object_group_ids_ = std::move(rebuilt_group_ids);
+        service_->groups_needing_lease_refresh_ =
+            std::move(groups_needing_refresh);
+    }
     return {};
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    restored_allocated_mem_by_segment_.clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
@@ -6253,7 +6213,15 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
-                                                    MetadataShard& shard) {
+                                                    MetadataShard& shard,
+                                                    bool keep_incomplete_metadata,
+                                                    std::unordered_map<
+                                                        std::string,
+                                                        std::string>&
+                                                        rebuilt_group_ids,
+                                                    std::unordered_set<
+                                                        std::string>&
+                                                        groups_needing_refresh) {
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
@@ -6317,6 +6285,13 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
+        // Drop incomplete objects during restore instead of inserting them
+        // and then performing a separate cleanup scan afterward.
+        if (!keep_incomplete_metadata &&
+            metadata_ptr->HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+            continue;
+        }
+
         auto& tenant_state = shard.tenants[tenant_id];
         const std::string user_key = key;
         auto [it, inserted] = tenant_state.metadata.emplace(
@@ -6330,6 +6305,28 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+
+        if (it->second.IsGrouped()) {
+            tenant_state.group_members[it->second.group_id].insert(user_key);
+            rebuilt_group_ids[MakeTenantScopedKey(tenant_id, user_key)] =
+                it->second.group_id;
+            groups_needing_refresh.insert(
+                MakeTenantScopedKey(tenant_id, it->second.group_id));
+        }
+
+        for (const auto& replica : it->second.GetAllReplicas()) {
+            if (!replica.get_descriptor().is_memory_replica()) {
+                continue;
+            }
+            auto segment_names = replica.get_segment_names();
+            if (segment_names.empty() || !segment_names[0].has_value()) {
+                continue;
+            }
+            restored_allocated_mem_by_segment_[segment_names[0].value()] +=
+                static_cast<int64_t>(
+                    replica.get_descriptor().get_memory_descriptor()
+                        .buffer_descriptor.size_);
+        }
     }
 
     return {};
