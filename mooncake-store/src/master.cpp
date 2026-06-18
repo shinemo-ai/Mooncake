@@ -137,11 +137,9 @@ DEFINE_uint32(promotion_admission_threshold, 2,
 DEFINE_uint32(promotion_queue_limit, 50000,
               "Max in-flight promotion tasks across all shards");
 DEFINE_uint32(promotion_max_per_heartbeat, 1,
-              "Max promotion tasks returned to a single client per "
-              "PromotionObjectHeartbeat call. Each task is a synchronous "
-              "SSD-read + RDMA-write on the client; serializing them avoids "
-              "blocking past the client-liveness window. Default 1 is "
-              "conservative.");
+              "Max promotion tasks per PromotionObjectHeartbeat call "
+              "(batch size). Tunes staging-buffer pressure indirectly. "
+              "Default 1 is conservative.");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",

@@ -626,6 +626,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Re-report SSD capacity after remount so master
+                    // can restore file_total_capacity_.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity after remount failed: "
+                                << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
@@ -663,9 +674,26 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    // Refresh SSD capacity on every heartbeat so a restarted master can
+    // recover file_total_capacity_ without requiring store restart.
+    if (config_.total_size_limit > 0) {
+        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+        if (!cap_result) {
+            LOG(WARNING) << "Periodic ReportSsdCapacity failed: "
+                         << cap_result.error();
+        }
+    }
+
+    // Drive any pending L2->L1 promotion work for this client on every
+    // heartbeat, independent of whether there are new offload tasks.
+    // Failures inside ProcessPromotionTasks are logged per-key and do not
+    // propagate; promotion is best-effort and must never break offload.
+    (void)ProcessPromotionTasks();
+
     if (offloading_objects.empty()) {
         return {};
     }
+
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
@@ -673,11 +701,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                    << offload_result.error();
         return offload_result;
     }
-
-    // Drive any pending L2->L1 promotion work for this client. Failures
-    // inside ProcessPromotionTasks are logged per-key and do not propagate;
-    // promotion is best-effort and must never break offload.
-    (void)ProcessPromotionTasks();
 
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
@@ -693,9 +716,6 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     auto heartbeat_result =
         client_->PromotionObjectHeartbeat(promotion_objects);
     if (!heartbeat_result) {
-        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
-        // first heartbeat tick if the master forgets us (e.g. across a master
-        // restart): benign no-op until next ReMount.
         if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
             return {};
         }
@@ -710,125 +730,208 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
-    // No segment preference from the client: let master pick from any
-    // DRAM segment.
     const std::vector<std::string> preferred_segments;
 
-    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
-    // returning at most one task per call so the heartbeat thread stays
-    // within the client-liveness window even for large objects. Leftover
-    // work stays queued in the master's promotion_objects map and is
-    // returned on subsequent heartbeats; we process whatever we received
-    // here without a second client-side cap.
+    // —— Phase 1: Batch AllocStart by tenant ——
+    // Group valid tasks by tenant_id and use BatchPromotionAllocStart
+    // (one RPC per tenant instead of one RPC per key).
+    struct ValidTask {
+        std::string key;
+        std::string tenant_id;
+        std::string storage_key;
+        int64_t size;
+    };
+    std::unordered_map<std::string, std::vector<ValidTask>> tasks_by_tenant;
     for (const auto& task : promotion_objects) {
-        const auto& key = task.key;
-        const auto& tenant_id = task.tenant_id;
-        const int64_t size = task.size;
-        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
-        if (size <= 0) {
-            LOG(WARNING) << "Skipping promotion for key=" << key
-                         << " with non-positive size=" << size;
+        if (task.size <= 0) {
+            LOG(WARNING) << "Skipping promotion for key=" << task.key
+                         << " with non-positive size=" << task.size;
             continue;
         }
-
-        auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
-        if (!alloc_result) {
-            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
-            // DRAM pressure). No staged buffer to release, but the
-            // task entry already claimed a promotion_in_flight_ slot
-            // at admission. Notify the master to release it
-            // immediately; otherwise the slot stays pinned for the
-            // reaper TTL (~10 min default), turning transient DRAM
-            // pressure into a sustained outage of promotion_queue_limit_.
-            // Notify is idempotent and handles alloc_id == 0 correctly.
-            VLOG(1) << "PromotionAllocStart failed for key=" << key
-                    << ", error=" << alloc_result.error()
-                    << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-            continue;
-        }
-
-        // Every failure path past this point has a master-side staged
-        // PROCESSING MEMORY buffer and an incremented in-flight slot.
-        // Eagerly notify the master on failure so the buffer is
-        // reclaimed and the slot is freed; otherwise transient SSD
-        // throttling or RDMA flakes saturate promotion_queue_limit_
-        // for the full reaper TTL. NotifyPromotionFailure is
-        // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-        };
-
-        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
-        // from the local SSD backend into it. AllocateBatch returns a
-        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
-        // staging space when the local goes out of scope.
-        std::vector<std::string> single_key{storage_key};
-        std::vector<int64_t> single_size{size};
-        auto allocate_res = AllocateBatch(single_key, single_size);
-        if (!allocate_res) {
-            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
-                         << ", error=" << allocate_res.error();
-            release_master_state();
-            continue;
-        }
-        auto staging = allocate_res.value();
-        auto load_res = BatchLoad(staging->slices);
-        if (!load_res) {
-            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
-                         << ", error=" << load_res.error();
-            release_master_state();
-            continue;
-        }
-
-        // (b) TE-write from the staging slice into the freshly-allocated
-        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
-        // correction in BatchLoad, so re-read it from the slice map.
-        auto slice_it = staging->slices.find(storage_key);
-        if (slice_it == staging->slices.end()) {
-            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
-            release_master_state();
-            continue;
-        }
-        std::vector<Slice> tx_slices{slice_it->second};
-        ErrorCode write_err = client_->PromotionWrite(
-            alloc_result.value().memory_descriptor, tx_slices);
-        if (write_err != ErrorCode::OK) {
-            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
-                         << ", error=" << write_err;
-            release_master_state();
-            continue;
-        }
-
-        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
-        // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
-        if (!notify_res) {
-            // The write landed but the commit failed. We can't retry the
-            // commit (the success path is one-shot via alloc_id), and we
-            // don't know whether the failure was transient or structural.
-            // Release the master-side state so the slot is reusable; the
-            // bytes we wrote become stranded under a soon-to-be-erased
-            // PROCESSING replica, which is harmless.
-            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
-                         << key << ", error=" << notify_res.error();
-            release_master_state();
-            continue;
-        }
-
-        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+        tasks_by_tenant[task.tenant_id].push_back(ValidTask{
+            .key = task.key,
+            .tenant_id = task.tenant_id,
+            .storage_key = MakeTenantScopedStorageKey(task.tenant_id, task.key),
+            .size = task.size,
+        });
     }
+
+    struct Candidate {
+        std::string key;
+        std::string tenant_id;
+        std::string storage_key;
+        int64_t size;
+        PromotionAllocStartResponse alloc;
+    };
+    std::vector<Candidate> candidates;
+
+    for (auto& [tid, tasks] : tasks_by_tenant) {
+        std::vector<std::string> keys;
+        std::vector<uint64_t> sizes;
+        keys.reserve(tasks.size());
+        sizes.reserve(tasks.size());
+        for (const auto& t : tasks) {
+            keys.push_back(t.key);
+            sizes.push_back(static_cast<uint64_t>(t.size));
+        }
+        auto results = client_->BatchPromotionAllocStart(
+            keys, tid, sizes, preferred_segments);
+        if (results.size() != tasks.size()) {
+            LOG(ERROR) << "BatchPromotionAllocStart size mismatch: got "
+                       << results.size() << " expected " << tasks.size()
+                       << "; releasing all " << tasks.size()
+                       << " tasks for tenant " << tid;
+            for (const auto& t : tasks) {
+                auto release = client_->NotifyPromotionFailure(t.key, tid);
+                if (!release) {
+                    VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                            << t.key << ", error=" << release.error();
+                }
+            }
+            continue;
+        }
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& t = tasks[i];
+            if (!results[i]) {
+                VLOG(1) << "PromotionAllocStart failed for key=" << t.key
+                        << ", error=" << results[i].error()
+                        << " (likely no free DRAM); releasing master slot";
+                auto release = client_->NotifyPromotionFailure(t.key, tid);
+                if (!release) {
+                    VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                            << t.key << ", error=" << release.error()
+                            << "; master reaper will reclaim on TTL expiry";
+                }
+                continue;
+            }
+            candidates.push_back(Candidate{
+                .key = t.key,
+                .tenant_id = t.tenant_id,
+                .storage_key = t.storage_key,
+                .size = t.size,
+                .alloc = std::move(results[i].value()),
+            });
+        }
+    }
+
+    if (candidates.empty()) {
+        return {};
+    }
+
+    // Helper: release master-side resources on failure past AllocStart.
+    auto release_master = [this](const std::string& key,
+                                 const std::string& tenant_id) {
+        auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        if (!release) {
+            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                    << key << ", error=" << release.error()
+                    << "; master reaper will reclaim on TTL expiry";
+        }
+    };
+
+    // —— Phase 2: Batched SSD read for all candidates ——
+    // Allocate staging buffer and read from SSD in one batch, matching
+    // the pattern used by OffloadObjects.
+    std::vector<std::string> batch_keys;
+    std::vector<int64_t> batch_sizes;
+    batch_keys.reserve(candidates.size());
+    batch_sizes.reserve(candidates.size());
+    for (const auto& c : candidates) {
+        batch_keys.push_back(c.storage_key);
+        batch_sizes.push_back(c.size);
+    }
+
+    auto allocate_res = AllocateBatch(batch_keys, batch_sizes);
+    if (!allocate_res) {
+        LOG(WARNING) << "Promotion: batched AllocateBatch failed for "
+                     << batch_keys.size() << " keys, error="
+                     << allocate_res.error();
+        for (const auto& c : candidates) {
+            release_master(c.key, c.tenant_id);
+        }
+        return {};
+    }
+    auto staging = allocate_res.value();
+
+    auto load_res = BatchLoad(staging->slices);
+    if (!load_res) {
+        LOG(WARNING) << "Promotion: batched BatchLoad failed for "
+                     << batch_keys.size() << " keys, error=" << load_res.error();
+        for (const auto& c : candidates) {
+            release_master(c.key, c.tenant_id);
+        }
+        return {};
+    }
+
+    VLOG(1) << "ProcessPromotionTasks batched SSD read: " << candidates.size()
+            << " keys, " << (staging->total_size / (1024 * 1024))
+            << " MiB total";
+
+    // —— Phase 3: Per-key RDMA write, then batch Notify by tenant ——
+    // RDMA targets differ per key so writes cannot be batched. Collect
+    // successfully written keys grouped by tenant_id, then batch-commit
+    // via BatchNotifyPromotionSuccess (one RPC per tenant instead of one
+    // RPC per key), mirroring OffloadObjects' batch NotifyOffloadSuccess.
+    std::unordered_map<std::string, std::vector<size_t>> success_by_tenant;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& c = candidates[i];
+        auto slice_it = staging->slices.find(c.storage_key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "Promotion: staging slice missing for key="
+                         << c.key;
+            release_master(c.key, c.tenant_id);
+            continue;
+        }
+
+        std::vector<Slice> tx_slices{slice_it->second};
+        ErrorCode write_err =
+            client_->PromotionWrite(c.alloc.memory_descriptor, tx_slices);
+        if (write_err != ErrorCode::OK) {
+            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << c.key
+                         << ", error=" << write_err;
+            release_master(c.key, c.tenant_id);
+            continue;
+        }
+
+        success_by_tenant[c.tenant_id].push_back(i);
+    }
+
+    // Batch-notify success per tenant. Per-key failures in the batch
+    // response are handled by releasing the master slot for those keys.
+    for (auto& [tid, indices] : success_by_tenant) {
+        std::vector<std::string> keys;
+        keys.reserve(indices.size());
+        for (size_t idx : indices) {
+            keys.push_back(candidates[idx].key);
+        }
+        auto results =
+            client_->BatchNotifyPromotionSuccess(keys, tid);
+        if (results.size() != indices.size()) {
+            LOG(ERROR) << "BatchNotifyPromotionSuccess size mismatch: got "
+                       << results.size() << " expected " << indices.size()
+                       << "; releasing all " << indices.size()
+                       << " keys for tenant " << tid;
+            for (size_t idx : indices) {
+                release_master(candidates[idx].key, candidates[idx].tenant_id);
+            }
+            continue;
+        }
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& c = candidates[indices[i]];
+            if (!results[i]) {
+                LOG(WARNING) << "Promotion: BatchNotifyPromotionSuccess failed"
+                             << " for key=" << c.key
+                             << ", error=" << results[i].error();
+                release_master(c.key, c.tenant_id);
+                continue;
+            }
+            VLOG(1) << "Promotion completed for key=" << c.key
+                    << ", size=" << c.size;
+        }
+    }
+
+    // staging (AllocatedBatch) goes out of scope here — all buffer
+    // handles are RAII-released after the last RDMA write completes.
 
     return {};
 }

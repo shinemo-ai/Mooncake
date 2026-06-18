@@ -457,6 +457,16 @@ class MasterClient {
                         const std::vector<std::string>& preferred_segments);
 
     /**
+     * @brief Batch allocate MEMORY replicas for multiple promotion keys.
+     * Follows BatchPutStart's pattern: one RPC, loops per-key.
+     */
+    [[nodiscard]] std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+    BatchPromotionAllocStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+        const std::vector<std::string>& preferred_segments);
+
+    /**
      * @brief Release master-side promotion task state after a client-side
      * failure that prevents the holder from calling NotifyPromotionSuccess.
      * Idempotent; returns OK if the task was already swept by the reaper.
@@ -476,6 +486,22 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    /**
+     * @brief Batch commit staged MEMORY replicas for multiple keys.
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchNotifyPromotionSuccess(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
+
+    /**
+     * @brief Batch release promotion task state for multiple keys.
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchNotifyPromotionFailure(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Start a copy operation

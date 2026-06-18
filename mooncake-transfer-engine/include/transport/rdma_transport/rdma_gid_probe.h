@@ -95,9 +95,10 @@ inline std::optional<AutoGidCandidateClass> classifyAutoGidCandidate(
     }
 
     const bool is_roce_v2 = candidate.gid_type == IBV_GID_TYPE_ROCE_V2;
-    const bool is_overlay =
-        is_roce_v2 && (candidate.is_overlay_network ||
-                       (candidate.is_ipv4_mapped && candidate.is_overlay_ipv4));
+    // Only classify as overlay when the underlying network device is overlay
+    // (flannel, calico, etc.). IPv4-mapped GIDs are always routable and should
+    // not be degraded based on their IP range alone.
+    const bool is_overlay = is_roce_v2 && candidate.is_overlay_network;
     const bool is_link_local =
         is_roce_v2 && !candidate.is_ipv4_mapped && candidate.is_link_local_ipv6;
     const bool is_degraded = is_overlay || is_link_local;
@@ -185,7 +186,8 @@ inline bool shouldAttemptAutoGidHandshakeRetry(bool auto_gid_selection_enabled,
                                                bool failure_happened_at_rtr,
                                                int sys_errno) {
     return auto_gid_selection_enabled && retry_count < max_retries &&
-           failure_happened_at_rtr && sys_errno == EINVAL;
+           failure_happened_at_rtr &&
+           (sys_errno == EINVAL || sys_errno == ETIMEDOUT);
 }
 
 inline bool didAutoGidSelectionChange(int previous_gid_index,

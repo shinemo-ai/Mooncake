@@ -31,7 +31,17 @@
 #include "config.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 
+#include <arpa/inet.h>
+
 namespace mooncake {
+
+// Format an IB GID as a human-readable string.
+static std::string gidToIpString(const ibv_gid &gid) {
+    char buf[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &gid, buf, sizeof(buf));
+    return std::string(buf);
+}
+
 constexpr uint8_t kMaxHopLimit = 16;
 constexpr uint8_t kTimeout = 14;
 constexpr uint8_t kRetryCount = 7;
@@ -971,7 +981,13 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
-        PLOG(ERROR) << "[Handshake] " << message;
+        PLOG(ERROR) << "[Handshake] " << message
+            << " device=" << context_.deviceName()
+            << " sgid_index=" << local_gid_index
+            << " dgid=" << gidToIpString(peer_gid)
+            << " dlid=" << peer_lid
+            << " dest_qp=" << peer_qp_num
+            << " peer_nic=" << peer_nic_path_;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kRtr;

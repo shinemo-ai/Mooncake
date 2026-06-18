@@ -376,26 +376,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             all_passed = false;
         }
 
-        if (before.local_disk_segments.size() !=
-            after.local_disk_segments.size()) {
-            LOG(ERROR) << "local_disk_segments size mismatch. before="
+        if (!after.local_disk_segments.empty()) {
+            LOG(ERROR) << "local_disk_segments should be cleared after "
+                          "restore. before="
                        << before.local_disk_segments.size()
                        << ", after=" << after.local_disk_segments.size();
             all_passed = false;
-        } else {
-            for (const auto& [client_id, seg_state] :
-                 before.local_disk_segments) {
-                auto it = after.local_disk_segments.find(client_id);
-                if (it == after.local_disk_segments.end()) {
-                    LOG(ERROR) << "local_disk_segment missing for client_id";
-                    all_passed = false;
-                    continue;
-                }
-                if (!CompareLocalDiskSegmentState(seg_state, it->second)) {
-                    LOG(ERROR) << "local_disk_segment state mismatch";
-                    all_passed = false;
-                }
-            }
         }
 
         // ========== Level 1: Basic state comparison ==========
@@ -679,13 +665,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Compare all msgpack files in two snapshot directories
     bool CompareSnapshotDirectories(const std::string& dir1,
-                                    const std::string& dir2) const {
+                                    const std::string& dir2,
+                                    bool compare_segments_file) const {
         LOG(INFO) << "Comparing snapshot directories: " << dir1 << " vs "
                   << dir2;
 
-        // Actual snapshot has three files: metadata, segments, and task_manager
-        std::vector<std::string> files_to_compare = {"metadata", "segments",
-                                                     "task_manager"};
+        std::vector<std::string> files_to_compare = {"metadata"};
+        if (compare_segments_file) {
+            files_to_compare.push_back("segments");
+        }
+        files_to_compare.push_back("task_manager");
 
         bool all_match = true;
         int file_count = 0;
@@ -746,15 +735,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             << "Failed to persist restored state: "
             << persist_result2.error().message;
 
-        // ========== Phase 5: Compare two metadata snapshots ==========
-        bool snapshots_match = CompareSnapshotDirectories(
-            GetBackupDir(backup_id), GetSnapshotDir(snapshot_id2));
-        EXPECT_TRUE(snapshots_match);
-
-        // ========== Phase 6: Capture state before snapshot ==========
+        // ========== Phase 5: Capture state before snapshot ==========
         // Note: Capture state after snapshot to avoid internal state changes
         // affecting comparison
         ServiceStateSnapshot state_before = CaptureServiceState(service.get());
+
+        // ========== Phase 6: Compare two metadata snapshots ==========
+        // Restored services intentionally clear client_local_disk_segment_
+        // and rely on remount + ScanMeta to rebuild that runtime state, so
+        // the serialized "segments" file no longer round-trips byte-for-byte
+        // once LOCAL_DISK state exists.
+        bool snapshots_match = CompareSnapshotDirectories(
+            GetBackupDir(backup_id), GetSnapshotDir(snapshot_id2),
+            state_before.local_disk_segments.empty());
+        EXPECT_TRUE(snapshots_match);
 
         // ========== Phase 7: Capture state after restore ==========
         ServiceStateSnapshot state_after =

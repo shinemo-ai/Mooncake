@@ -34,21 +34,19 @@ class FakeClient : public Client {
     tl::expected<void, ErrorCode> heartbeat_result =
         tl::expected<void, ErrorCode>{};
 
+    // Configurable heartbeat batch cap (mirrors promotion_max_per_heartbeat_).
+    size_t max_per_heartbeat = 1;
+
     tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects) override {
         heartbeat_calls.fetch_add(1);
         if (!heartbeat_result.has_value()) {
             return tl::make_unexpected(heartbeat_result.error());
         }
-        // Mirror production master: PromotionObjectHeartbeat returns at
-        // most kMaxPerHeartbeat keys per call (see
-        // MasterService::PromotionObjectHeartbeat) and leaves the rest
-        // queued for subsequent calls. Tests iterate by calling
-        // ProcessPromotionTasks multiple times until heartbeat_queue is
-        // empty.
-        constexpr size_t kMaxPerHeartbeat = 1;
+        // Mirror production master: drains up to max_per_heartbeat tasks
+        // per call (controlled by promotion_max_per_heartbeat_).
         promotion_objects.clear();
-        while (promotion_objects.size() < kMaxPerHeartbeat &&
+        while (promotion_objects.size() < max_per_heartbeat &&
                !heartbeat_queue.empty()) {
             promotion_objects.push_back(std::move(heartbeat_queue.back()));
             heartbeat_queue.pop_back();
@@ -84,6 +82,22 @@ class FakeClient : public Client {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         return default_alloc_response;
+    }
+
+    // BatchPromotionAllocStart: delegates to per-key so that
+    // alloc_overrides and counters work transparently.
+    std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+    BatchPromotionAllocStart(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        const std::vector<uint64_t>& sizes,
+        const std::vector<std::string>& preferred_segments) override {
+        std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.push_back(PromotionAllocStart(keys[i], tenant_id, sizes[i],
+                                                  preferred_segments));
+        }
+        return results;
     }
 
     // PromotionWrite: per-key dispatch.
@@ -124,6 +138,19 @@ class FakeClient : public Client {
         return {};
     }
 
+    // BatchNotifyPromotionSuccess: delegates to per-key NotifyPromotionSuccess
+    // so that notify_overrides and counters work transparently.
+    std::vector<tl::expected<void, ErrorCode>> BatchNotifyPromotionSuccess(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id) override {
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            results.push_back(NotifyPromotionSuccess(key, tenant_id));
+        }
+        return results;
+    }
+
     // NotifyPromotionFailure: records calls so tests can assert that
     // post-AllocStart failure paths in ProcessPromotionTasks actually
     // notify the master.
@@ -138,6 +165,18 @@ class FakeClient : public Client {
         notify_failure_calls.fetch_add(1);
         notify_failure_keys.push_back(key);
         return {};
+    }
+
+    // BatchNotifyPromotionFailure: delegates to per-key NotifyPromotionFailure.
+    std::vector<tl::expected<void, ErrorCode>> BatchNotifyPromotionFailure(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id) override {
+        std::vector<tl::expected<void, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            results.push_back(NotifyPromotionFailure(key, tenant_id));
+        }
+        return results;
     }
 
     std::atomic<int> heartbeat_calls{0};
@@ -192,13 +231,11 @@ class FileStoragePromotionTest : public ::testing::Test {
         return file_storage->ProcessPromotionTasks();
     }
 
-    // Drain a multi-key queue across multiple ticks. ProcessPromotionTasks
-    // caps work at 1 task/tick (heartbeat-safety) and the FakeClient's
-    // PromotionObjectHeartbeat mirrors production by clearing the queue on
-    // drain. So the test fixture has to push the remaining keys back
-    // between ticks, the same way the master would re-push if the gate
-    // re-fires. We track which key was processed via fake->last_alloc_key
-    // and remove it from the working set.
+    // Drain a multi-key queue across multiple ticks. The FakeClient's
+    // PromotionObjectHeartbeat mirrors the master's per-heartbeat batch
+    // cap, so the test fixture re-pushes remaining keys between ticks.
+    // We track which key was processed via fake->last_alloc_key and
+    // remove it from the working set.
     tl::expected<void, ErrorCode> DrainAllPromotionTasks(
         std::unordered_map<std::string, int64_t> remaining) {
         tl::expected<void, ErrorCode> last_res{};
@@ -214,8 +251,7 @@ class FileStoragePromotionTest : public ::testing::Test {
             if (!last_res.has_value()) return last_res;
             if (fake->last_alloc_key == before ||
                 !remaining.contains(fake->last_alloc_key)) {
-                // No forward progress (e.g., empty effective queue / size<=0
-                // skip on every key); avoid infinite loop.
+                // No forward progress; avoid infinite loop.
                 break;
             }
             remaining.erase(fake->last_alloc_key);
@@ -362,8 +398,8 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
 // TransferWrite / Notify-Success). Each failure mode must release the
 // master slot. Exercises three modes (AllocStart itself, missing-file
 // BatchLoad, override on Notify) by draining across successive
-// heartbeats (the FakeClient mirrors the master's kMaxPerHeartbeat = 1
-// cap) and verifies each one releases.
+// heartbeats (the FakeClient mirrors the master's per-heartbeat cap)
+// and verifies each one releases.
 TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
     // k_load_fail: no override -> AllocStart succeeds, but BatchLoad
@@ -392,6 +428,36 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_alloc_fail"), 1u);
     EXPECT_EQ(got.count("k_load_fail"), 1u);
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
+}
+
+// With max_per_heartbeat=3, the heartbeat returns 3 tasks in one batch
+// and ProcessPromotionTasks exercises the real multi-key batch code path
+// (BatchPromotionAllocStart, batched AllocateBatch/BatchLoad,
+// BatchNotifyPromotionSuccess). Without raising the heartbeat cap, all
+// batch tests degenerate to single-key calls.
+TEST_F(FileStoragePromotionTest, MultiKeyBatchExercisesBatchRpcPaths) {
+    fake->max_per_heartbeat = 3;
+
+    // Push 3 promotable keys — BatchLoad will fail for all of them
+    // (no SSD files exist), but the batch code paths are exercised.
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "batch_k1", .size = 1024},
+        {.tenant_id = "default", .key = "batch_k2", .size = 2048},
+        {.tenant_id = "default", .key = "batch_k3", .size = 4096},
+    };
+
+    auto res = CallProcessPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+
+    // Single heartbeat fetched all 3 keys.
+    EXPECT_EQ(fake->heartbeat_calls.load(), 1);
+
+    // All 3 reached BatchPromotionAllocStart.
+    EXPECT_EQ(fake->alloc_calls.load(), 3);
+
+    // BatchLoad fails (no SSD files), so all 3 are released.
+    EXPECT_EQ(fake->notify_failure_calls.load(), 3);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
 }
 
 }  // namespace mooncake

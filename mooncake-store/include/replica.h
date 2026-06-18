@@ -410,6 +410,25 @@ class Replica {
         return std::nullopt;
     }
 
+    void update_local_disk_replica(UUID client_id, uint64_t object_size,
+                                   std::string transport_endpoint) {
+        if (!is_local_disk_replica()) {
+            LOG(ERROR) << "Invalid replica type: " << type()
+                       << ", expected LOCAL_DISK";
+            return;
+        }
+        auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        if (disk_data.object_size != object_size) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk_data.object_size);
+            MasterMetricManager::instance().inc_allocated_file_size(
+                object_size);
+        }
+        disk_data.client_id = client_id;
+        disk_data.object_size = object_size;
+        disk_data.transport_endpoint = std::move(transport_endpoint);
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);

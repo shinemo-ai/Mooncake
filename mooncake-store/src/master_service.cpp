@@ -135,6 +135,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      restore_grace_period_sec_([]() -> int64_t {
+          const char* env = std::getenv("MC_RESTORE_GRACE_PERIOD_SEC");
+          if (env) {
+              try {
+                  int64_t val = std::stoll(env);
+                  if (val > 0) return val;
+              } catch (...) {}
+          }
+          return 60;
+      }()),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -170,6 +180,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    // Override offloading queue limit from env var if set
+    {
+        const char* env_val = std::getenv("MC_OFFLOADING_QUEUE_LIMIT");
+        if (env_val) {
+            offloading_queue_limit_ = std::stoull(env_val);
+            LOG(INFO) << "MC_OFFLOADING_QUEUE_LIMIT set, offloading_queue_limit="
+                      << offloading_queue_limit_;
+        }
+    }
+    MasterMetricManager::instance().set_offloading_queue_limit(
+        static_cast<int64_t>(offloading_queue_limit_));
+
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -1191,7 +1213,8 @@ auto MasterService::BatchReplicaClear(
                 &Replica::fn_is_completed, [](Replica& replica) {
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
+                    } else if (replica.is_disk_replica() ||
+                               replica.is_local_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
                 });
@@ -1225,7 +1248,8 @@ auto MasterService::BatchReplicaClear(
                     has_replica_on_segment = true;
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
+                    } else if (replica.is_disk_replica() ||
+                               replica.is_local_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
                 });
@@ -1338,7 +1362,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         // TODO: NoF SSD support (ranhaojia)
         if (replica_list[0].is_memory_replica()) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
-        } else if (replica_list[0].is_disk_replica()) {
+        } else if (replica_list[0].is_disk_replica() ||
+                   replica_list[0].is_local_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
         }
         MasterMetricManager::instance().inc_valid_get_nums();
@@ -1709,6 +1734,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                         object_id.user_key,
                         OffloadingTask{replica.id(),
                                        std::chrono::system_clock::now()});
+                } else {
+                    MasterMetricManager::instance()
+                        .inc_offload_queue_push_failures();
+                    LOG_FIRST_N(WARNING, 100)
+                        << "PutEnd offload queue push failed: key="
+                        << object_id.user_key
+                        << ", error=" << toString(result.error());
                 }
             });
     }
@@ -1722,7 +1754,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     if (replica_type == ReplicaType::MEMORY ||
         (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().inc_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
+    } else if (replica_type == ReplicaType::DISK ||
+               replica_type == ReplicaType::LOCAL_DISK) {
         MasterMetricManager::instance().inc_file_cache_nums();
     }  // TODO: add inc_nof_cache_nums() (ranhaojia)
     // 1. Set lease timeout to now, indicating that the object has no lease
@@ -1736,7 +1769,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id, Replica& replica)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, MakeObjectIdentity(key, tenant_id));
+    const auto object_id = MakeObjectIdentity(key, tenant_id);
+    MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         accessor.Create(
             client_id,
@@ -1757,23 +1791,21 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return {};
     }
 
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
+    auto* local_disk_replica =
+        metadata.GetFirstReplica(&Replica::fn_is_local_disk_replica);
+    if (local_disk_replica == nullptr) {
+        return {};
+    }
+
+    const auto incoming = replica.get_descriptor().get_local_disk_descriptor();
+    const auto previous_owner = local_disk_replica->get_local_disk_client_id();
+    local_disk_replica->update_local_disk_replica(
+        client_id, incoming.object_size, incoming.transport_endpoint);
+
+    auto& tenant_state = accessor.GetTenantState();
+    if (!previous_owner.has_value() || previous_owner.value() != client_id) {
+        ErasePromotionTaskIfPresent(tenant_state, object_id.user_key);
+    }
     return {};
 }
 
@@ -1812,7 +1844,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     if (replica_type == ReplicaType::MEMORY ||
         (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
+    } else if (replica_type == ReplicaType::DISK ||
+               replica_type == ReplicaType::LOCAL_DISK) {
         MasterMetricManager::instance().dec_file_cache_nums();
     }
 
@@ -2212,6 +2245,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                            .get_local_disk_descriptor()
                            .client_id == client_id;
         });
+        MasterMetricManager::instance().dec_file_cache_nums();
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
@@ -3123,6 +3157,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                  local_disk_segment_it->second->offloading_objects) {
                 result.push_back(task);
             }
+            MasterMetricManager::instance().dec_offloading_queue_size(
+                local_disk_segment_it->second->offloading_objects.size());
             local_disk_segment_it->second->offloading_objects.clear();
             return result;
         }
@@ -3286,6 +3322,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        MasterMetricManager::instance().inc_offloading_queue_size();
     }
     return {};
 }
@@ -3444,15 +3481,17 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    // Return at most promotion_max_per_heartbeat_ tasks. Each task does
-    // a synchronous SSD read + RDMA write on the client side; allowing
-    // more than one per heartbeat risks blocking past the client-
-    // liveness window and the master marking the client dead. The rest
-    // stay queued in promotion_objects for subsequent heartbeats. The
-    // cap must live here (server side) rather than on the client so
-    // leftover work isn't silently dropped.
+    // Drain up to promotion_max_per_heartbeat_ tasks per heartbeat.
+    // This controls the batch size the client processes in one cycle,
+    // indirectly capping staging-buffer pressure from the subsequent
+    // batched SSD reads. Remaining tasks stay queued for the next
+    // heartbeat. Set higher when object sizes are small and staging
+    // buffer capacity allows; lower when objects are large or the
+    // staging buffer is shared with normal read traffic.
     auto& src = local_disk_segment_it->second->promotion_objects;
     std::vector<PromotionTaskItem> result;
+    result.reserve(std::min(src.size(),
+                            static_cast<size_t>(promotion_max_per_heartbeat_)));
     while (result.size() < promotion_max_per_heartbeat_ && !src.empty()) {
         auto node = src.extract(src.begin());
         result.push_back(std::move(node.mapped()));
@@ -3687,6 +3726,48 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     }
 
     return {};
+}
+
+auto MasterService::BatchPromotionAllocStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+    const std::vector<std::string>& preferred_segments)
+    -> std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>> {
+    if (keys.size() != sizes.size()) {
+        return std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.push_back(PromotionAllocStart(client_id, keys[i], tenant_id,
+                                              sizes[i], preferred_segments));
+    }
+    return results;
+}
+
+auto MasterService::BatchNotifyPromotionSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(NotifyPromotionSuccess(client_id, key, tenant_id));
+    }
+    return results;
+}
+
+auto MasterService::BatchNotifyPromotionFailure(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(NotifyPromotionFailure(client_id, key, tenant_id));
+    }
+    return results;
 }
 
 void MasterService::EvictionThreadFunc() {
@@ -4830,71 +4911,16 @@ bool MasterService::TryRestoreStateFromSnapshot(
         }
 
         {
-            const bool skip_cleanup = std::getenv(
-                "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
-            if (!skip_cleanup) {
-                auto cleanup_now = now;
-                for (auto& shard : metadata_shards_) {
-                    for (auto tenant_it = shard.tenants.begin();
-                         tenant_it != shard.tenants.end();) {
-                        auto& tenant_state = tenant_it->second;
-                        for (auto it = tenant_state.metadata.begin();
-                             it != tenant_state.metadata.end();) {
-                            if (it->second.HasDiffRepStatus(
-                                    ReplicaStatus::COMPLETE) ||
-                                (it->second.IsLeaseExpired(cleanup_now) &&
-                                 !it->second.IsSoftPinned(cleanup_now))) {
-                                VLOG(1) << "clear metadata key=" << it->first;
-                                it = EraseMetadata(tenant_state, it,
-                                                   tenant_it->first);
-                            } else {
-                                ++it;
-                            }
-                        }
-                        if (tenant_state.Empty()) {
-                            tenant_it = shard.tenants.erase(tenant_it);
-                        } else {
-                            ++tenant_it;
-                        }
-                    }
-                }
-            }
-
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
             }
 
-            for (auto& shard : metadata_shards_) {
-                for (auto& [tenant_id, tenant_state] : shard.tenants) {
-                    for (auto it = tenant_state.metadata.begin();
-                         it != tenant_state.metadata.end();) {
-                        for (auto& replica : it->second.GetAllReplicas()) {
-                            if (!replica.get_descriptor().is_memory_replica()) {
-                                continue;
-                            }
-                            auto temp_segment_names =
-                                replica.get_segment_names();
-                            if (temp_segment_names.empty()) {
-                                continue;
-                            }
-                            if (!temp_segment_names[0].has_value()) {
-                                continue;
-                            }
-                            auto buffer_descriptor =
-                                replica.get_descriptor()
-                                    .get_memory_descriptor()
-                                    .buffer_descriptor;
-                            MasterMetricManager::instance()
-                                .inc_allocated_mem_size(
-                                    temp_segment_names[0].value(),
-                                    static_cast<int64_t>(
-                                        buffer_descriptor.size_));
-                        }
-                        ++it;
-                    }
-                }
+            for (const auto& [segment_name, allocated_bytes] :
+                 metadata_serializer.restored_allocated_mem_by_segment()) {
+                MasterMetricManager::instance().inc_allocated_mem_size(
+                    segment_name, allocated_bytes);
             }
 
             LOG(INFO)
@@ -4936,6 +4962,21 @@ bool MasterService::TryRestoreStateFromSnapshot(
                 LOG(ERROR) << "[Restore] Failed to get all segments, error: "
                            << err;
             }
+        }
+
+        // Set restore grace period to allow clients time to remount
+        {
+            auto grace_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(restore_grace_period_sec_);
+            auto deadline_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    grace_deadline.time_since_epoch())
+                    .count();
+            restore_grace_deadline_epoch_ms_.store(deadline_ms,
+                                                  std::memory_order_relaxed);
+            LOG(INFO) << "[Restore] Client expire grace period set to "
+                      << restore_grace_period_sec_ << "s";
         }
 
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
@@ -5531,16 +5572,31 @@ void MasterService::ClientMonitorFunc() {
                 now + std::chrono::seconds(client_live_ttl_sec_);
         }
 
-        // Find out expired clients
+        // Find out expired clients (skip during restore grace period)
         std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        int64_t grace_deadline_ms =
+            restore_grace_deadline_epoch_ms_.load(std::memory_order_relaxed);
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+        bool in_grace_period = (grace_deadline_ms > 0 && now_ms < grace_deadline_ms);
+        if (in_grace_period) {
+            // During restore grace period, do not expire any clients
+        } else {
+            if (grace_deadline_ms > 0) {
+                // Grace period just ended, clear the deadline
+                restore_grace_deadline_epoch_ms_.store(0,
+                                                      std::memory_order_relaxed);
+            }
+            for (auto it = client_ttl.begin(); it != client_ttl.end();) {
+                if (it->second < now) {
+                    LOG(INFO) << "client_id=" << it->first
+                              << ", action=client_expired";
+                    expired_clients.push_back(it->first);
+                    it = client_ttl.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
@@ -5943,6 +5999,8 @@ MasterService::MetadataSerializer::Serialize() {
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::Deserialize(
     const std::vector<uint8_t>& data) {
+    restored_allocated_mem_by_segment_.clear();
+
     // Parse MessagePack data directly
     msgpack::object_handle oh;
     try {
@@ -5990,6 +6048,13 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
     }
 
+    std::unordered_map<std::string, std::string> rebuilt_group_ids;
+    std::unordered_set<std::string> groups_needing_refresh;
+    const bool keep_incomplete_metadata = std::getenv(
+        "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    // Rebuild group routing and surviving-memory metrics while deserializing
+    // to avoid additional full-key passes after restore.
     // Iterate and deserialize each shard
     for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
         // Get shard index
@@ -6029,7 +6094,10 @@ MasterService::MetadataSerializer::Deserialize(
 
         // Get shard reference and deserialize
         auto& shard = service_->metadata_shards_[shard_idx];
-        auto result = DeserializeShard(shard_obj, shard);
+        auto result = DeserializeShard(shard_obj, shard,
+                                       keep_incomplete_metadata,
+                                       rebuilt_group_ids,
+                                       groups_needing_refresh);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -6061,11 +6129,18 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
-    service_->RebuildGroupRoutingIndex();
+    {
+        std::unique_lock<std::shared_mutex> lock(
+            service_->group_routing_mutex_);
+        service_->object_group_ids_ = std::move(rebuilt_group_ids);
+        service_->groups_needing_lease_refresh_ =
+            std::move(groups_needing_refresh);
+    }
     return {};
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    restored_allocated_mem_by_segment_.clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
@@ -6138,7 +6213,15 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
-                                                    MetadataShard& shard) {
+                                                    MetadataShard& shard,
+                                                    bool keep_incomplete_metadata,
+                                                    std::unordered_map<
+                                                        std::string,
+                                                        std::string>&
+                                                        rebuilt_group_ids,
+                                                    std::unordered_set<
+                                                        std::string>&
+                                                        groups_needing_refresh) {
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
@@ -6202,6 +6285,13 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
+        // Drop incomplete objects during restore instead of inserting them
+        // and then performing a separate cleanup scan afterward.
+        if (!keep_incomplete_metadata &&
+            metadata_ptr->HasDiffRepStatus(ReplicaStatus::COMPLETE)) {
+            continue;
+        }
+
         auto& tenant_state = shard.tenants[tenant_id];
         const std::string user_key = key;
         auto [it, inserted] = tenant_state.metadata.emplace(
@@ -6215,6 +6305,28 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+
+        if (it->second.IsGrouped()) {
+            tenant_state.group_members[it->second.group_id].insert(user_key);
+            rebuilt_group_ids[MakeTenantScopedKey(tenant_id, user_key)] =
+                it->second.group_id;
+            groups_needing_refresh.insert(
+                MakeTenantScopedKey(tenant_id, it->second.group_id));
+        }
+
+        for (const auto& replica : it->second.GetAllReplicas()) {
+            if (!replica.get_descriptor().is_memory_replica()) {
+                continue;
+            }
+            auto segment_names = replica.get_segment_names();
+            if (segment_names.empty() || !segment_names[0].has_value()) {
+                continue;
+            }
+            restored_allocated_mem_by_segment_[segment_names[0].value()] +=
+                static_cast<int64_t>(
+                    replica.get_descriptor().get_memory_descriptor()
+                        .buffer_descriptor.size_);
+        }
     }
 
     return {};

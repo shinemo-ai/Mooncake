@@ -243,6 +243,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPromotionAllocStart> {
+    static constexpr const char* value = "BatchPromotionAllocStart";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
     static constexpr const char* value = "NotifyPromotionSuccess";
 };
@@ -250,6 +255,16 @@ struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailure> {
     static constexpr const char* value = "NotifyPromotionFailure";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchNotifyPromotionSuccess> {
+    static constexpr const char* value = "BatchNotifyPromotionSuccess";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchNotifyPromotionFailure> {
+    static constexpr const char* value = "BatchNotifyPromotionFailure";
 };
 
 template <>
@@ -1046,6 +1061,20 @@ MasterClient::PromotionAllocStart(
     return result;
 }
 
+std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+MasterClient::BatchPromotionAllocStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPromotionAllocStart");
+    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
+                     ", tenant_id=", tenant_id);
+    return invoke_batch_rpc<
+        &WrappedMasterService::BatchPromotionAllocStart,
+        PromotionAllocStartResponse>(
+        keys.size(), client_id, keys, tenant_id, sizes, preferred_segments);
+}
+
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key) {
     return NotifyPromotionSuccess(client_id, key, tenant_id_);
@@ -1080,6 +1109,30 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
             client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchNotifyPromotionSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchNotifyPromotionSuccess");
+    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
+                     ", tenant_id=", tenant_id);
+    return invoke_batch_rpc<
+        &WrappedMasterService::BatchNotifyPromotionSuccess, void>(
+        keys.size(), client_id, keys, tenant_id);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchNotifyPromotionFailure(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchNotifyPromotionFailure");
+    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
+                     ", tenant_id=", tenant_id);
+    return invoke_batch_rpc<
+        &WrappedMasterService::BatchNotifyPromotionFailure, void>(
+        keys.size(), client_id, keys, tenant_id);
 }
 
 tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(

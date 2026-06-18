@@ -207,12 +207,26 @@ class WrappedMasterService {
         const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments);
 
+    std::vector<tl::expected<PromotionAllocStartResponse, ErrorCode>>
+    BatchPromotionAllocStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id, const std::vector<uint64_t>& sizes,
+        const std::vector<std::string>& preferred_segments);
+
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchNotifyPromotionSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchNotifyPromotionFailure(
+        const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id);
 
     tl::expected<UUID, ErrorCode> CreateDrainJob(

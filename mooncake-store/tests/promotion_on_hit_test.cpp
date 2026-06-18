@@ -205,6 +205,48 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
+// Re-registering a LOCAL_DISK key from a restarted store should transfer
+// ownership to the new client and drop any stale promotion task pinned to the
+// old holder.
+TEST_F(PromotionOnHitTest, NotifyOffloadSuccessRebindsLocalDiskOwner) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    UUID old_client = PrepareLocalDiskOnlyClient(*service);
+    UUID new_client = PrepareLocalDiskOnlyClient(*service);
+
+    const std::string key = "k_rebind";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, old_client, key, 1024,
+                                       "old-holder"));
+
+    auto first_get = service->GetReplicaList(key);
+    ASSERT_TRUE(first_get.has_value());
+
+    auto pending_old_before = service->PromotionObjectHeartbeat(old_client);
+    ASSERT_TRUE(pending_old_before.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_old_before, key), 1u);
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, new_client, key, 1024,
+                                       "new-holder"));
+
+    auto pending_old_after = service->PromotionObjectHeartbeat(old_client);
+    ASSERT_TRUE(pending_old_after.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_old_after, key), 0u);
+
+    auto second_get = service->GetReplicaList(key);
+    ASSERT_TRUE(second_get.has_value());
+
+    auto pending_new_after = service->PromotionObjectHeartbeat(new_client);
+    ASSERT_TRUE(pending_new_after.has_value());
+    EXPECT_EQ(CountPromotionTask(*pending_new_after, key), 1u);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty task list when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
@@ -607,27 +649,22 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat caps the per-call response at kMaxPerHeartbeat
-// (1) and leaves the remainder queued for subsequent heartbeats. This is
-// the master-side bound that keeps the client's heartbeat thread inside
-// the liveness window when many keys are queued, while guaranteeing no
-// task is dropped — a regression from the prior client-side cap that
-// silently discarded leftovers.
-TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
+// PromotionObjectHeartbeat drains up to promotion_max_per_heartbeat_ tasks
+// per call. Remaining tasks stay queued for subsequent heartbeats. This
+// controls the batch size the client processes in one cycle.
+TEST_F(PromotionOnHitTest, HeartbeatBatchCapControlsDrainSize) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;  // batch size = 2
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
-    // Push three keys into the holder's promotion_objects via the trigger
-    // path. Each is a LOCAL_DISK-only key (no MEMORY replica), so the
-    // first GetReplicaList per key crosses the admission threshold (=1)
-    // and TryPushPromotionQueue enqueues a task.
+    // Push three keys into the holder's promotion_objects.
     const std::vector<std::string> keys{"hb_k1", "hb_k2", "hb_k3"};
     for (const auto& k : keys) {
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k, 1024,
@@ -636,40 +673,22 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
         ASSERT_TRUE(r.has_value());
     }
 
-    // First heartbeat returns at most 1 key.
+    // First heartbeat returns at most 2 keys (batch cap).
     auto tick1 = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(tick1.has_value());
-    EXPECT_EQ(tick1->size(), 1u)
-        << "heartbeat should return at most kMaxPerHeartbeat=1 entry";
-    std::string first_key = tick1->begin()->key;
-    EXPECT_TRUE(std::find(keys.begin(), keys.end(), first_key) != keys.end());
+    EXPECT_EQ(tick1->size(), 2u);
 
-    // Second heartbeat returns another key (a different one).
+    // Second heartbeat returns the 1 remaining key.
     auto tick2 = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(tick2.has_value());
     EXPECT_EQ(tick2->size(), 1u);
-    std::string second_key = tick2->begin()->key;
-    EXPECT_NE(second_key, first_key)
-        << "second heartbeat must drain a different leftover key, not "
-        << "re-return the one already extracted";
 
-    // Third heartbeat returns the third key.
+    // Third heartbeat: queue is empty.
     auto tick3 = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(tick3.has_value());
-    EXPECT_EQ(tick3->size(), 1u);
-    std::string third_key = tick3->begin()->key;
-    EXPECT_NE(third_key, first_key);
-    EXPECT_NE(third_key, second_key);
+    EXPECT_TRUE(tick3->empty());
 
-    // Fourth heartbeat: queue is now empty.
-    auto tick4 = service->PromotionObjectHeartbeat(seg.client_id);
-    ASSERT_TRUE(tick4.has_value());
-    EXPECT_TRUE(tick4->empty())
-        << "after draining all queued keys, heartbeat must return empty";
-
-    // Sanity: master-side promotion_tasks records are intact for all keys
-    // (they're cleared by NotifyPromotionSuccess, not by Heartbeat), so the
-    // source refcnts remain pinned until processed.
+    // Sanity: records are intact until NotifyPromotionSuccess clears them.
     for (const auto& k : keys) {
         auto rl = service->GetReplicaList(k, "default");
         ASSERT_TRUE(rl.has_value()) << "key " << k << " should still exist";
@@ -2089,6 +2108,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k1", 1024,
                                        seg.segment_name));
     {
